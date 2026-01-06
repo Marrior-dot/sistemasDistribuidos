@@ -1,0 +1,38 @@
+services:
+  mysql:
+    image: mysql:8.2
+    container_name: mysql
+    environment:
+     MYSQL_ROOT_PASSWORD: teste
+     MYSQL_DATABASE: teste
+    ports: 
+      - 3306:3306
+    volumes: 
+      - mysql-data:/var/lib/mysql
+  
+  mysql1:
+    image: mysql:8.2
+    container_name: mysql1
+    environment:
+     MYSQL_ROOT_PASSWORD: teste1
+     MYSQL_DATABASE: teste1
+    ports:
+      - 3307:3306
+    volumes: 
+      - mysql1-data:/var/lib/mysql
+  
+  mysql2:
+    image: mysql:8.2
+    container_name: mysql2
+    environment:
+     MYSQL_ROOT_PASSWORD: teste2
+     MYSQL_DATABASE: teste2
+    ports:
+      - 3308:3306
+    volumes: 
+      - mysql2-data:/var/lib/mysql
+
+volumes:
+  mysql-data:
+  mysql1-data:
+  mysql2-data:
