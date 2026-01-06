@@ -1,0 +1,1 @@
+02.01.2026 19:09:41 864,CREATE TABLE teste.data ( dadotexo VARCHAR(250) , id INT NOT NULL PRIMARY KEY ) engine=InnoDB
