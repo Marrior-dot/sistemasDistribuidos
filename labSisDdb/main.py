@@ -1,15 +1,15 @@
 from nodeCoord import NodeCoord 
 import asyncio
-
+import socket
 def conexaoSocket(node_id:int, host:str, port:int, listaAdicionar:list):
-    conexao = NodeCoord(node_id,host, port)
     try:
-        print(conexao.get_socket().)
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.connect((host, port))
+        conexao = NodeCoord(node_id,host, port)
+        listaAdicionar.append(conexao)
+        return conexao        
     except ConnectionRefusedError:
         return None
-    listaAdicionar.append(conexao)
-    return conexao
-    
 
 async def main():
     lista_nos = []
