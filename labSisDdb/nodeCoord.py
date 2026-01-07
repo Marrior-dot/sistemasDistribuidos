@@ -5,10 +5,9 @@ class NodeCoord:
         self.socketPort = socketPort
         self._node_id = node_id
         self.coordenador = False
-        self.sDb = socket.socket()
-
+        self.socket = socket.socket()
     def get_socket(self):
-        return self.sDb
+        return self.socket 
 
     def get_node_id(self) -> int:
         return self._node_id
