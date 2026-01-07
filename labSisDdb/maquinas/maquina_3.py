@@ -5,10 +5,15 @@ from node import Node
 def main():
   node_id = 0
   socketHost = 'localhost'
-  socketPort = 3001
+  socketPort = 3002
   dbHost = 'localhost'
-  dbPort = 3307
-  maquina_2 = Node(node_id,socketHost,socketPort,dbHost,dbPort)
+  dbPort = 3308
+  outrasMaquinas:list = [
+     {"host":'localhost', 
+      "port":3000},
+      {"host":'localhost', 
+      "port":3001}]
+  maquina_3 = Node(node_id,socketHost,socketPort,dbHost,dbPort)
   print ("Socket successfully created")
 if __name__ == "__main__":
     main()
