@@ -1,19 +1,17 @@
 # first of all import the socket library 
 #from middleware import middleware_connection
 from node import Node
+from addr import listaNos
+import asyncio
 # next create a socket object 
-def main():
-  node_id = 0
+async def main():
+  node_id = 2
   socketHost = 'localhost'
   socketPort = 3002
   dbHost = 'localhost'
   dbPort = 3308
-  outrasMaquinas:list = [
-     {"host":'localhost', 
-      "port":3000},
-      {"host":'localhost', 
-      "port":3001}]
-  maquina_3 = Node(node_id,socketHost,socketPort,dbHost,dbPort)
+  maquina_3 = Node(node_id,socketHost,socketPort,dbHost,dbPort, listaNos)
   print ("Socket successfully created")
+  await maquina_3.requisicoesServidor(listaNos)
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

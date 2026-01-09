@@ -16,7 +16,7 @@ async def main():
     maquina_1:NodeCoord | None = conexaoSocket(0,'localhost',3000, lista_nos) #NodeCoord(0,'localhost',3000)
     maquina_2:NodeCoord | None = conexaoSocket(1,'localhost',3001, lista_nos) #NodeCoord(1,'localhost',3001)
     maquina_3:NodeCoord | None = conexaoSocket(2,'localhost',3002, lista_nos) #NodeCoord(2,'localhost',3002)
-    print(lista_nos)
+    #print(lista_nos)
     while True:
       lista_nos[0].iniciarEleicao(lista_nos)
       await asyncio.sleep(2)
