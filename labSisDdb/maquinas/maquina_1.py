@@ -8,7 +8,7 @@ async def main():
   node_id = 0
   socketHost = 'localhost'
   socketPort = 3000     
-  dbHost = 'localhost'
+  dbHost = 'localhost'  #'172.22.75.155'
   dbPort = 3306
   maquina_1 = Node(node_id,socketHost,socketPort,dbHost,dbPort, listaNos)
   print ("Socket successfully created")
