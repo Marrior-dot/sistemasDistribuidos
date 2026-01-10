@@ -1,2 +1,2 @@
-mysql-connector-python
-psutil
+mysql-connector-python==9.5.0
+psutil==7.2.1
