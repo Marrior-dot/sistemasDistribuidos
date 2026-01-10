@@ -6,6 +6,8 @@ import mysql.connector
 from mysql.connector import Error
 import time
 import re
+import hashlib
+
 
 class Node:
     def __init__(self, node_id: int,socketHost:str,socketPort:int,dbHost:str,dbPort:int, listaNos:list):
@@ -61,48 +63,40 @@ class Node:
 
     #Elege o coordenador
     async def becomeCoordinator(self, maior, listaNos:list):
-        print(f"Nó de ID {maior["id"]} se torna coordernador")
-        #copia da lista de nós
-        listaNosCopia = listaNos
-        #mensagem enviada para informar os outros nós sobre o atual coordenador
-        msg_coordinator = {'id':maior['id'],'host':maior["host"],'port': maior["port"]}
-        #print(msg_coordinator)
-        #configura no nó atual o coordenador atual
+        print(f"Nó de ID {maior['id']} se torna coordernador")
+        
+        #Define quem é o novo chefe nos dados
+        msg_coordinator = {'id':maior['id'], 'host':maior["host"], 'port': maior["port"]}
         self.set_actual_coordinator(msg_coordinator)
 
-        #verifica se o nó atual é ou não o atual coordenador
-        if(self.get_socket_host() == maior['host'] and self.get_socket_port == maior['port']):
+        #Verifica se EU sou o maior. 
+        if (self.get_socket_host() == maior['host'] and self.get_socket_port() == maior['port']):
             self.set_coordinator(True)
+        else:
+            #SE O NOVO CHEFE NÃO SOU EU, EU DEIXO DE SER COORDENADOR
+            self.set_coordinator(False) 
         
-        #adiciona id à mensagem
-        #remove o nó que faz a eleição da lista copiada
-        listaNosCopia.remove(listaNosCopia[0])
-        msg_bytes = json.dumps(msg_coordinator).encode('utf-8')
-        for no in listaNosCopia:            
-            #inicia o socket
+
+        #Prepara mensagem (Protocolo Novo)
+        msg_bytes = self.empacotar_mensagem("ELECTION_WINNER", msg_coordinator)
+        
+        listaNosCopia = listaNos.copy()
+        
+        for no in listaNosCopia:
+            if no['id'] == self._node_id: 
+                continue
+
             socket_coordinator = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            #usado para compensar um delay do windows
             socket_coordinator.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            #faz conexão com os outros sockets
-            socket_coordinator.connect((no["host"], no["port"]))
             try:
-                #print(msg_bytes)
-                #garante o envio de todos os bytes
+                socket_coordinator.connect((no["host"], no["port"]))
                 socket_coordinator.sendall(msg_bytes)
-                #permite que a conexão seja fechada apenas se a mensagem tiver sido enviada
                 socket_coordinator.shutdown(socket.SHUT_WR)
-                print('socket em espera')
-                #time.sleep(10)
             except Exception as e:
                 print(e)
-                socket_coordinator.close()
-                continue            
             finally:
-                #fecha o socket
                 socket_coordinator.close()
-                #tempo para os outros nós processarem as mensagens
-                time.sleep(2)
-                continue
+                time.sleep(0.5)
 
             #envia a mensagem e fecha em seguida
     async def requisicoesServidor(self, listaNos:list):
@@ -132,7 +126,7 @@ class Node:
                 #Realiza utilizado para a primeira eleição
                 coordenador_vazio: bool = True if self.actual_coordinator == {} else False
                 #Realiza outra eleição apenas se o nó que é o atual coordenador não estiver mais atuante
-                nao_possui_coordernador:bool = self.actual_coordinator != {} and self.verificar_porta_listening(self.actual_coordinator['host'], self.actual_coordinator['port'])
+                nao_possui_coordernador:bool = self.actual_coordinator != {} and not self.verificar_porta_listening(self.actual_coordinator['host'], self.actual_coordinator['port'])
                 #Verifica se existe algum nó com id maior para ser o coordenador
                 no_id_maior:bool = False 
                 #print(self.actual_coordinator)
@@ -145,70 +139,82 @@ class Node:
                 if coordenador_vazio or nao_possui_coordernador or no_id_maior: 
                     await self.iniciarEleicao(nova_listaNos)
             try:
-                #Espera assíncrona de conexões
+                #Espera conexão
                 c, addr = await asyncio.wait_for(loop.sock_accept(self.sSocket), timeout=10.0)
                 c.setblocking(False)
-                print(c,addr)
-                #processamento da mensagem
+                
+                #Lê os dados
+                dados_brutos = await self.receber_dados(c, loop) 
+                
+                if dados_brutos:
+                    try:
+                        mensagem = json.loads(dados_brutos)
+                    except json.JSONDecodeError:
+                        c.close()
+                        continue
 
-                mensagem = await self.processar_mensagem(c,loop)
-                copia_mensagem = mensagem
-                #Regex para verificar se a mensagem veio pelo coordenador ou não 
-                regex_coordenador = r'false'
+                    #Valida Checksum
+                    if not self.validar_integridade(mensagem):
+                        print("Erro de integridade.")
+                        c.close()
+                        continue
 
-                #print(mensagem)
-                if len(addr) > 0: #Verifica se a conexão possui conteúdo
-                    #Se for coordenador manda para os outros nós
-                    if self._is_coordinator == True:
-                        #identifica se a mensagem é json ou não
-                        mensagem_json = self.identify_json_message(c,mensagem)
-                        #Se sim, o loop vai para a próxima instância 
-                        if mensagem_json == True:
-                            continue
-                        #print("problema aq")
-                        #Conexão com o banco
-                        if re.match(regex_coordenador, mensagem):
-                            #re.sub(padrão, substituto, string_original)
-                            query = re.sub(regex_coordenador, '', mensagem)
-                            # Opcional: remover espaços extras que possam sobrar
-                            query = query.strip()
-                            print(f"Mensagem processada: {query}")
-                            self.conexao_db(query)
-                        #Mandando para outras máquinas
-                        query = f"true\n{query}"
-                        for maquina in nova_listaNos:
-                            socket_maquina = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                            socket_maquina.connect((maquina['host'], maquina['port']))
-                            socket_maquina.send(query.encode())
-                            socket_maquina.shutdown(socket.SHUT_WR)
-                            socket_maquina.close()
-                    else:
-                        mensagem_json = self.identify_json_message(c,mensagem)
-                        if mensagem_json == True:
-                            continue 
-                        #Se verdadeiro manda para o coordenador
-                        print(copia_mensagem)
-                        if re.match(regex_coordenador, mensagem):
-                            try:
-                                socket_maquina = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                                socket_maquina.connect((self.actual_coordinator['host'], self.actual_coordinator['port']))
-                                socket_maquina.send(mensagem.encode())
-                                socket_maquina.shutdown(socket.SHUT_WR)
-                                socket_maquina.close()
-                                #c.connect((self.actual_coordinator['host'], self.actual_coordinator['port']))
-                                #c.send(mensagem.encode('utf-8'))
-                                #socket_maquina.shutdown(socket.SHUT_WR)
-                                #c.close()
-                            except Exception as e:
-                                print(f"Erro ao processar: {e}")
-                        else:
-                            query_db = re.sub(r'true','',mensagem)
-                            query_db = query_db.strip()
-                            self.conexao_db(query_db)
+                    tipo = mensagem.get('tipo')
+                    conteudo = mensagem.get('conteudo')
+
+                    resposta_para_cliente = None
+
+                    if tipo == 'CLIENT_REQUEST':
+                        print(f"Executando query: {conteudo}")
                         
+                        resposta_payload = ""
+
+                        if self._is_coordinator:
+                            print(f"--> [COORD] Executando localmente: {conteudo}")
+                            resultado_db = self.conexao_db(conteudo)
+                            
+                            #2. Replica (apenas se não for SELECT)
+                            if not conteudo.strip().upper().startswith("SELECT"):
+                                await self.replicar_para_workers(conteudo, nova_listaNos)
+                            
+                            #3. Monta o pacote de resposta com ID
+                            dados_retorno = {
+                                "resultado": resultado_db if resultado_db else "Operação realizada com sucesso.",
+                                "executor_id": self.get_node_id()
+                            }
+                            #Converte para string JSON para trafegar seguro
+                            resposta_payload = json.dumps(dados_retorno)
+                            
+                        else:
+                            print(f"--> [WORKER] Redirecionando para o coordenador: {conteudo}")
+                            resposta_payload = await self.consultar_coordenador(conteudo)
+
+                        #O conteudo agora é uma string JSON contendo {"resultado":..., "executor_id":...}
+                        pacote_resposta = self.empacotar_mensagem("RESPONSE", resposta_payload)
+                        
+                        await loop.sock_sendall(c, pacote_resposta)
+
+                    elif tipo == 'REPLICATION':
+                        self.conexao_db(conteudo)
+
+                    elif tipo == 'ELECTION_WINNER':
+                         self.set_actual_coordinator(conteudo)
+                         
+                         #Se o ID recebido for o meu, viro True. Se não, viro False.
+                         if conteudo['id'] == self.get_node_id():
+                             self.set_coordinator(True)
+                         else:
+                             self.set_coordinator(False) 
+                         
+                         print(f"Novo coordenador definido: ID {conteudo['id']}")
+
+                c.close()
+
             except socket.timeout:
                 continue
-            #await asyncio.sleep(5)
+            except Exception as e:
+                print(f"Erro: {e}")
+                c.close()
 
     #Verifica se a mensagem é um json que possui as informações sobre o coordenador
     def identify_json_message(self,c,mensagem:str):
@@ -232,30 +238,40 @@ class Node:
         self._is_coordinator = coordinator
     
     def conexao_db(self, mensagem):
-        #pass
-        connection = mysql.connector.connect(
-        host=self.dbHost,       # Change to your host (e.g., an IP address)
-        port=self.dbPort,
-        database='teste',     # The name of your database
-        user='root',            # Your MySQL username
-        password='teste'  # Your MySQL password
-        )
-        try:    
+        connection = None
+        try:
+            connection = mysql.connector.connect(
+                host=self.dbHost,
+                port=self.dbPort,
+                database='teste',
+                user='root',
+                password='teste'
+            )
+            
             cursor = connection.cursor()
-            #Execução da mensagem no banco de dados
             cursor.execute(mensagem)
+            
+            #Verifica se a query retornou linhas (Ex: SELECT)
+            if cursor.with_rows:
+                resultado = cursor.fetchall()
+                print(f"--- [DB] Resultado da Query: {resultado} ---")
+                return resultado
+            else:
+                #Se for INSERT/UPDATE/DELETE, confirma a transação
+                connection.commit()
+                print("--- [DB] Alteração commitada com sucesso ---")
+                return None
+
         except Error as e:
-            print(f"Error ao conectar com Mysql: {e}")
+            print(f"Erro ao conectar com Mysql: {e}")
         finally:
-            #fechar a conexão com o banco
-            if connection.is_connected():
+            if connection and connection.is_connected():
                 cursor.close()
                 connection.close()
-                print("Connection closed")
 
     #Processa a mensagem
     async def processar_mensagem(self,c, loop):
-    # Transforma o recv comum em uma tarefa aguardável (awaitable)
+    #Transforma o recv comum em uma tarefa aguardável (awaitable)
         try:
             #Espera pela mensagem do cliente
             data = await asyncio.wait_for(loop.sock_recv(c, 1024), timeout=5.0)
@@ -277,25 +293,114 @@ class Node:
     def verificar_porta_listening(self, host, porta):
         actual_host = '127.0.0.1' if host == 'localhost' else host
 
-        # 1. VERIFICAÇÃO LOCAL (Usando psutil para processos no mesmo PC)
-        # Útil para saber se o processo está rodando nesta máquina
+        #1. VERIFICAÇÃO LOCAL (Usando psutil para processos no mesmo PC)
+        #Útil para saber se o processo está rodando nesta máquina
         try:
             conexoes = psutil.net_connections()
             for conn in conexoes:
-                # Verifica se o IP bate (ou se está ouvindo em '0.0.0.0' que significa todas as interfaces)
+                #Verifica se o IP bate (ou se está ouvindo em '0.0.0.0' que significa todas as interfaces)
                 ip_bate = (conn.laddr.ip == actual_host or conn.laddr.ip == '0.0.0.0')
                 if ip_bate and conn.laddr.port == porta and conn.status == 'LISTEN':
                     print(f"Porta {porta} encontrada localmente via psutil.")
                     return True
         except (psutil.AccessDenied, psutil.NoSuchProcess):
-            pass # Algumas conexões exigem permissão de admin
+            pass #Algumas conexões exigem permissão de admin
 
-        # 2. VERIFICAÇÃO REMOTA (Usando Socket para outros PCs da rede)
-        # Se o psutil não achou, tentamos um "aperto de mão" TCP
+        #2. VERIFICAÇÃO REMOTA (Usando Socket para outros PCs da rede)
+        #Se o psutil não achou, tentamos um "aperto de mão" TCP
         try:
-            # Tenta criar uma conexão rápida
+            #Tenta criar uma conexão rápida
             with socket.create_connection((actual_host, porta), timeout=0.5):
                 print(f"Porta {porta} em {actual_host} está acessível (Remota/LAN).")
                 return True
         except (socket.timeout, ConnectionRefusedError, OSError):
             return False
+    
+    #Gera o checksum MD5 do conteúdo da mensagem
+    def gerar_checksum(self, conteudo: str) -> str:
+        return hashlib.md5(conteudo.encode('utf-8')).hexdigest()
+
+    #Cria o pacote JSON padrão
+    def empacotar_mensagem(self, tipo: str, conteudo: str) -> bytes:
+        dados = {
+            "tipo": tipo,    
+            "conteudo": conteudo,
+            "checksum": self.gerar_checksum(str(conteudo))
+        }
+        return json.dumps(dados).encode('utf-8')
+
+    #Valida se a mensagem recebida não foi corrompida
+    def validar_integridade(self, dados_json: dict) -> bool:
+        conteudo = str(dados_json.get('conteudo'))
+        checksum_recebido = dados_json.get('checksum')
+        checksum_calculado = self.gerar_checksum(conteudo)
+        return checksum_recebido == checksum_calculado
+    
+    #Método auxiliar para ler do socket (antigo processar_mensagem simplificado)
+    async def receber_dados(self, c, loop):
+        try:
+            data = await asyncio.wait_for(loop.sock_recv(c, 4096), timeout=5.0)
+            return data.decode().strip()
+        except:
+            return None
+
+    #Envia para todos os outros nós (Broadcast de replicação)
+    async def replicar_para_workers(self, query, lista_atual_nos):
+        pacote = self.empacotar_mensagem("REPLICATION", query)
+        
+        for maquina in lista_atual_nos:
+            #Não mandar para si mesmo
+            if maquina['id'] == self._node_id:
+                continue
+
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(2)
+                s.connect((maquina['host'], maquina['port']))
+                s.sendall(pacote)
+                s.close()
+            except Exception as e:
+                print(f"Falha ao replicar para nó {maquina['id']}: {e}")
+
+    #Envia para o coordenador (Unicast)
+    async def repassar_para_coordenador(self, query):
+        if not self.actual_coordinator:
+            print("Erro: Sem coordenador para repassar.")
+            return
+
+        pacote = self.empacotar_mensagem("CLIENT_REQUEST", query)
+        
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.connect((self.actual_coordinator['host'], self.actual_coordinator['port']))
+            s.sendall(pacote)
+            s.close()
+        except Exception as e:
+            print(f"Erro ao repassar ao coordenador: {e}")
+
+    
+    #Worker envia para coordenador e AGUARDA resposta
+    async def consultar_coordenador(self, query):
+        if not self.actual_coordinator:
+            return "Erro: Sem coordenador disponível."
+
+        pacote = self.empacotar_mensagem("CLIENT_REQUEST", query)
+        
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(5.0) #Timeout para não travar se o coord morrer
+        try:
+            s.connect((self.actual_coordinator['host'], self.actual_coordinator['port']))
+            s.sendall(pacote)
+            
+            #Espera a resposta do coordenador
+            dados_retorno = s.recv(4096) 
+            if dados_retorno:
+                msg_json = json.loads(dados_retorno.decode())
+                #Retorna apenas o conteudo (o resultado do banco)
+                return msg_json.get('conteudo')
+            else:
+                return "Sem resposta do coordenador."
+        except Exception as e:
+            return f"Erro na comunicação com coordenador: {e}"
+        finally:
+            s.close()
