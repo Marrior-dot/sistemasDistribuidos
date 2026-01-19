@@ -215,11 +215,15 @@ class Node:
                     await self.iniciarEleicao(nova_listaNos)
 
             try:
+                #Espera conexão com o cliente
                 c, addr = await asyncio.wait_for(loop.sock_accept(self.sSocket), timeout=5.0)
+                #Faz com que a conexão não seja bloqueanted
                 c.setblocking(False)
+                #Pega os dados que são recebidos
                 dados_brutos = await self.receber_dados(c, loop) 
                 
                 if dados_brutos:
+                    #Parse da mensagem
                     try: mensagem = json.loads(dados_brutos)
                     except: 
                         c.close(); continue
@@ -227,38 +231,54 @@ class Node:
                     if not self.validar_integridade(mensagem):
                         c.close(); continue
 
+                    #Pega atributos 'tipo' e 'conteudo'
                     tipo = mensagem.get('tipo')
                     conteudo = mensagem.get('conteudo')
 
+                    #Se tipo for 'WHO_IS_COORD', somente o primeiro nó da lista realiza essa operação
                     if tipo == 'WHO_IS_COORD':
+                        #Empacota as informações do coordernador e manda para os demais nós
                         resp = self.actual_coordinator if self.actual_coordinator else {}
                         pacote = self.empacotar_mensagem("COORDINATOR_INFO", resp)
                         await loop.sock_sendall(c, pacote)
 
+                    #Se tipo for 'CLIENT_REQUEST'
                     elif tipo == 'CLIENT_REQUEST':
+                        #Verifica se o próprio nó é um coordenador
                         resposta_payload = ""
                         if self._is_coordinator:
                             print(f"--> [COORD] Query: {conteudo}")
+                            #Manda a querry dentro de 'conteudo' para o banco de dados
                             resultado_db = self.conexao_db(conteudo)
+
+                            #Se conteúdo não for uma consulta SELECT, faz um LOG e manda para os outros nós a querry
+                            #LOG serve para guardar as últimas operações realizadas
                             if not conteudo.strip().upper().startswith("SELECT"):
                                 novo_id = self.registrar_log(conteudo)
                                 self.salvar_estado(novo_id)
                                 await self.replicar_para_workers(conteudo, nova_listaNos)
+
                             dados_retorno = {"resultado": resultado_db if resultado_db else "Sucesso.", "executor_id": self.get_node_id()}
                             resposta_payload = json.dumps(dados_retorno, default=str)
+
+                        #Se não for a mensagem deve ser mandada para o coordenador
                         else:
                             print(f"--> [WORKER] Redirecionando...")
                             resposta_payload = await self.consultar_coordenador(conteudo)
+                        #Empacotamento da resposta
                         pacote_resposta = self.empacotar_mensagem("RESPONSE", resposta_payload)
+                        #Manda para o cliente
                         await loop.sock_sendall(c, pacote_resposta)
 
+                    #Replica a última ação realizada pelo coordenador
                     elif tipo == 'REPLICATION':
                         self.conexao_db(conteudo)
                         self.ultimo_id_processado += 1
                         self.salvar_estado(self.ultimo_id_processado)
                         # Salva no log para futuro
                         self.registrar_log_externo({'id': self.ultimo_id_processado, 'query': conteudo})
-
+                    
+                    #Sincroniza com os outros nós, recebe mensagens como , quem é o atual coordenador
                     elif tipo == 'SYNC_REQUEST':
                         ultimo_id_cliente = int(conteudo)
                         print(f"Pedido de Sync (ID Cliente: {ultimo_id_cliente})")
@@ -266,9 +286,11 @@ class Node:
                         pacote_resposta = self.empacotar_mensagem("SYNC_RESPONSE", json.dumps(logs_faltantes, default=str))
                         await loop.sock_sendall(c, pacote_resposta)
 
+                    #Recebe mensagem sobre o coordenador eleito
                     elif tipo == 'ELECTION_WINNER':
                          dados_coord = json.loads(conteudo)
                          self.set_actual_coordinator(dados_coord)
+                         #Se o nó atual tiver o mesmo ID do coordenador, ele se torna o coordenador
                          if dados_coord['id'] == self.get_node_id():
                              self.set_coordinator(True)
                              self.ja_sincronizou = True
@@ -302,6 +324,7 @@ class Node:
         finally:
             if connection and connection.is_connected(): cursor.close(); connection.close()
 
+    #Verifica localmente e remotamente os nós a serem conectados
     def verificar_porta_listening(self, host, porta):
         actual_host = '127.0.0.1' if host == 'localhost' else host
         try:
@@ -311,35 +334,44 @@ class Node:
         try:
             with socket.create_connection((actual_host, porta), timeout=0.2): return True
         except: return False
-            
+    
+    #Realiza o checksum
     def gerar_checksum(self, conteudo: str) -> str:
         return hashlib.md5(conteudo.encode('utf-8')).hexdigest()
 
+    # Empacotamento em formato Json
     def empacotar_mensagem(self, tipo: str, conteudo) -> bytes:
         if isinstance(conteudo, (dict, list)): conteudo_str = json.dumps(conteudo, default=str)
         else: conteudo_str = str(conteudo)
         dados = {"tipo": tipo, "conteudo": conteudo_str, "checksum": self.gerar_checksum(conteudo_str)}
+        print(f"Nó de ID {self._node_id} envia: {dados}")
         return json.dumps(dados, default=str).encode('utf-8')
 
+    #Usa o Checksum pra validar a integridade
     def validar_integridade(self, dados_json: dict) -> bool:
+        print(f"Checksum recebido: {dados_json.get('checksum')}", "Checksum gerado:", self.gerar_checksum(str(dados_json.get('conteudo'))))
         return dados_json.get('checksum') == self.gerar_checksum(str(dados_json.get('conteudo')))
     
+    #Decodifica os dados recebidos
     async def receber_dados(self, c, loop):
         try:
             data = await asyncio.wait_for(loop.sock_recv(c, 8192), timeout=5.0)
             return data.decode().strip()
         except: return None
 
+    #Replicação de mensagens para os outros nós
     async def replicar_para_workers(self, query, lista_atual_nos):
         pacote = self.empacotar_mensagem("REPLICATION", query)
         for maquina in lista_atual_nos:
             if maquina['id'] == self._node_id: continue
             try:
+                #Nó aqui é sincrono
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 s.settimeout(2); s.connect((maquina['host'], maquina['port']))
                 s.sendall(pacote); s.shutdown(socket.SHUT_WR); s.close()
             except: pass
 
+    #Consulta ao coordenador, para pegar informações atuais
     async def consultar_coordenador(self, query):
         if not self.actual_coordinator: return "Sem coordenador."
         pacote = self.empacotar_mensagem("CLIENT_REQUEST", query)
@@ -357,6 +389,7 @@ class Node:
         except Exception as e: return f"Erro: {e}"
         finally: s.close()
     
+    #Solicitação de sincronização ao coordenador
     async def solicitar_sincronizacao(self):
         if not self.actual_coordinator: return False
         print(f"Sincronizando... (Último ID Local: {self.ultimo_id_processado})")
