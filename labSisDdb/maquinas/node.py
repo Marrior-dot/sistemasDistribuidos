@@ -9,6 +9,12 @@ import time
 import hashlib
 import threading
 
+TIMEOUT_HEARTBEAT = 3.0       # Tolera perda de 1 ou 2 pings antes de declarar morte
+TIMEOUT_CONNECT = 5.0         # Tempo generoso para o Handshake TCP (SYN/ACK)
+TIMEOUT_REPLICATION = 15.0    # Tempo para querys simples e updates
+TIMEOUT_SYNC_HEAVY = 60.0     # Tempo para Snapshots e Logs grandes
+INTERVALO_AUDITORIA = 20      # Verifica consistência a cada 20s
+
 class Node:
     def __init__(self, node_id: int, socketHost:str, socketPort:int, dbHost:str, dbPort:int, listaNos:list):
         self._node_id = node_id
@@ -125,7 +131,7 @@ class Node:
             if maquina['id'] == self._node_id: continue
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(2)
+                s.settimeout(TIMEOUT_CONNECT)
                 s.connect((maquina['host'], maquina['port']))
                 s.sendall(pacote)
                 try: s.shutdown(socket.SHUT_WR)
@@ -136,7 +142,7 @@ class Node:
     def verificar_porta_listening(self, host, porta):
         actual_host = '127.0.0.1' if host == 'localhost' else host
         try:
-            with socket.create_connection((actual_host, porta), timeout=0.5): 
+            with socket.create_connection((actual_host, porta), timeout=TIMEOUT_HEARTBEAT): 
                 return True
         except: 
             return False
@@ -178,7 +184,7 @@ class Node:
             if no['id'] == self._node_id: continue
             if self.verificar_porta_listening(no['host'], no['port']):
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(2.0)
+                s.settimeout(TIMEOUT_CONNECT)
                 try:
                     s.connect((no['host'], no['port']))
                     s.sendall(pacote)
@@ -228,7 +234,7 @@ class Node:
         for no in listaNosCopia:
             if no['id'] == self._node_id: continue
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(1)
+            s.settimeout(TIMEOUT_CONNECT)
             try:
                 s.connect((no["host"], no["port"]))
                 s.sendall(msg_bytes)
@@ -319,7 +325,7 @@ class Node:
                     await self.iniciarEleicao(lista_para_eleicao)
 
             try:
-                c, addr = await asyncio.wait_for(loop.sock_accept(self.sSocket), timeout=1.0)
+                c, addr = await asyncio.wait_for(loop.sock_accept(self.sSocket), timeout=TIMEOUT_CONNECT)
                 c.setblocking(False)
                 dados_brutos = await self.receber_dados(c, loop) 
                 
@@ -508,7 +514,7 @@ class Node:
             print(f"Tentando replicar para Nó {maquina['id']} ({maquina['host']}:{maquina['port']})...")
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(3) 
+                s.settimeout(TIMEOUT_CONNECT) 
                 s.connect((maquina['host'], maquina['port']))
                 s.sendall(pacote)
                 try: s.shutdown(socket.SHUT_WR)
@@ -521,7 +527,7 @@ class Node:
     async def consultar_coordenador(self, query):
         if not self.actual_coordinator: return "Sem coordenador."
         pacote = self.empacotar_mensagem("CLIENT_REQUEST", query)
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.settimeout(10.0) 
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.settimeout(TIMEOUT_REPLICATION) 
         try:
             s.connect((self.actual_coordinator['host'], self.actual_coordinator['port']))
             s.sendall(pacote)
@@ -539,7 +545,7 @@ class Node:
         if not self.actual_coordinator: return False
         print(f"Sincronizando... (Último ID Local: {self.ultimo_id_processado})")
         pacote = self.empacotar_mensagem("SYNC_REQUEST", str(self.ultimo_id_processado))
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.settimeout(15.0) 
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.settimeout(TIMEOUT_SYNC_HEAVY) 
         try:
             s.connect((self.actual_coordinator['host'], self.actual_coordinator['port']))
             s.sendall(pacote)
@@ -577,7 +583,7 @@ class Node:
         conteudo_req = json.dumps(tabelas_alvo) if tabelas_alvo else ""
         pacote = self.empacotar_mensagem("REQUEST_SNAPSHOT", conteudo_req)
         
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.settimeout(30.0)
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.settimeout(TIMEOUT_SYNC_HEAVY)
         try:
             s.connect((self.actual_coordinator['host'], self.actual_coordinator['port']))
             s.sendall(pacote)
