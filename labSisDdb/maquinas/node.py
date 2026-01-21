@@ -7,6 +7,7 @@ import mysql.connector
 from mysql.connector import Error
 import time
 import hashlib
+import threading
 
 class Node:
     def __init__(self, node_id: int, socketHost:str, socketPort:int, dbHost:str, dbPort:int, listaNos:list):
@@ -17,6 +18,7 @@ class Node:
         self.dbHost = dbHost
         self.dbPort = dbPort
         self.listaNos = listaNos
+        
         self.actual_coordinator = {}
         
         self.arquivo_estado = f"estado_node_{node_id}.json"
@@ -25,6 +27,9 @@ class Node:
         self.log_operacoes = self.carregar_log_disco()
         self.ultimo_id_processado = self.carregar_estado()
         self.ja_sincronizou = False
+
+        self.listaNosAtivos = []
+        self.thread_running = False
 
     # --- Persistência ---
     def carregar_log_disco(self):
@@ -52,7 +57,6 @@ class Node:
         ids_existentes = [i['id'] for i in self.log_operacoes]
         if item_log['id'] not in ids_existentes:
             self.log_operacoes.append(item_log)
-            # Ordena por ID para garantir consistência
             self.log_operacoes.sort(key=lambda x: x['id'])
             self.salvar_log_disco()
 
@@ -84,7 +88,87 @@ class Node:
     def set_coordinator(self, coordinator: bool) -> None:
         self._is_coordinator = coordinator
 
-    # --- Descoberta ---
+    # --- Threads de Monitoramento (Heartbeat + Consistência) ---
+    def thread_monitoramento_geral(self):
+        """
+        Thread única que gerencia Heartbeat e Verificação de Consistência
+        """
+        print("--- Thread de Monitoramento Iniciada ---")
+        ultimo_check_consistencia = time.time()
+        INTERVALO_CONSISTENCIA = 10 # Executa checksum a cada 10 segundos
+
+        while self.thread_running:
+            temp_ativos = []
+            for no in self.listaNos:
+                if self.verificar_porta_listening(no['host'], no['port']):
+                    temp_ativos.append(no)
+            self.listaNosAtivos = temp_ativos
+            
+            # Verificação de Consistência periódica (apenas coordenador)
+            if self._is_coordinator and (time.time() - ultimo_check_consistencia > INTERVALO_CONSISTENCIA):
+                self.disparar_verificacao_consistencia()
+                ultimo_check_consistencia = time.time()
+            
+            time.sleep(3) 
+
+    def disparar_verificacao_consistencia(self):
+        checksums_local = self.obter_checksum_por_tabela()
+        print(f"[AUDITORIA] Checksums: {checksums_local}")
+        
+        # Envia o dicionário JSON para os workers
+        pacote = self.empacotar_mensagem("CONSISTENCY_CHECK", json.dumps(checksums_local))
+        threading.Thread(target=self.broadcast_simples, args=(pacote,)).start()
+
+    def broadcast_simples(self, pacote):
+        # Envia para todos os nós ativos sem esperar resposta
+        for maquina in self.listaNosAtivos:
+            if maquina['id'] == self._node_id: continue
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(2)
+                s.connect((maquina['host'], maquina['port']))
+                s.sendall(pacote)
+                try: s.shutdown(socket.SHUT_WR)
+                except: pass
+                s.close()
+            except: pass
+
+    def verificar_porta_listening(self, host, porta):
+        actual_host = '127.0.0.1' if host == 'localhost' else host
+        try:
+            with socket.create_connection((actual_host, porta), timeout=0.5): 
+                return True
+        except: 
+            return False
+
+    def obter_checksum_por_tabela(self):
+        """
+        Retorna um dicionário com o checksum de cada tabela.
+        Ex: {'clientes': 998877, 'pedidos': 112233}
+        """
+        conn = None
+        checksums = {}
+        try:
+            conn = mysql.connector.connect(host=self.dbHost, port=self.dbPort, database='teste', user='root', password='teste')
+            cursor = conn.cursor()
+            
+            cursor.execute("SHOW TABLES")
+            tabelas = cursor.fetchall()
+            
+            for tab in tabelas:
+                nome_tabela = tab[0]
+                cursor.execute(f"CHECKSUM TABLE {nome_tabela}")
+                res = cursor.fetchone()
+                if res:
+                    checksums[nome_tabela] = res[1] # Nome: Valor
+                    
+        except Error as e:
+            print(f"Erro Checksum DB: {e}")
+        finally:
+            if conn and conn.is_connected(): conn.close()
+            
+        return checksums
+
     async def descobrir_coordenador(self, listaNos):
         print("Buscando coordenador na rede...")
         pacote = self.empacotar_mensagem("WHO_IS_COORD", "")
@@ -106,13 +190,17 @@ class Node:
                             if coord_data and 'id' in coord_data:
                                 print(f"Coordenador encontrado: ID {coord_data['id']}")
                                 self.set_actual_coordinator(coord_data)
+                                
+                                if coord_data['id'] == self._node_id:
+                                    print("A rede diz que EU sou o coordenador.")
+                                    self.set_coordinator(True)
+                                    self.ja_sincronizou = True                                
                                 encontrou = True
                                 break
                 except: pass
                 finally: s.close()
         return encontrou
 
-    # --- Eleição ---
     async def iniciarEleicao(self, listaNos:list):
         maior = {"id":self.get_node_id(), "host":self.get_socket_host(), "port":self.get_socket_port()}
         print(">>> INICIANDO ELEIÇÃO <<<")
@@ -135,38 +223,41 @@ class Node:
         
         msg_bytes = self.empacotar_mensagem("ELECTION_WINNER", msg_coordinator)
         
+        # Envia a notícia para todos
         listaNosCopia = listaNos.copy()
         for no in listaNosCopia:
             if no['id'] == self._node_id: continue
-            socket_coordinator = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            socket_coordinator.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(1)
             try:
-                socket_coordinator.connect((no["host"], no["port"]))
-                socket_coordinator.sendall(msg_bytes)
-                socket_coordinator.shutdown(socket.SHUT_WR)
+                s.connect((no["host"], no["port"]))
+                s.sendall(msg_bytes)
+                s.shutdown(socket.SHUT_WR)
             except: pass
             finally:
-                socket_coordinator.close()
-                time.sleep(0.1)
+                s.close()
 
-    # --- CORE: BARREIRA DE SINCRONIZAÇÃO (NOVO) ---
     async def realizar_bootstrap_sync(self):
-        """
-        Bloqueia a inicialização até que o nó esteja sincronizado com o coordenador.
-        Se o coordenador cair durante o processo, libera para eleição.
-        """
+        if self._is_coordinator:
+            self.ja_sincronizou = True
+            return
+
+        if self.actual_coordinator and self.actual_coordinator['id'] == self._node_id:
+            self.set_coordinator(True)
+            self.ja_sincronizou = True
+            return
+
         while self.actual_coordinator and not self._is_coordinator and not self.ja_sincronizou:
             print(f"--- [BOOTSTRAP] Tentando sincronizar com ID {self.actual_coordinator['id']} ---")
             
-            # Verifica se coordenador ainda está vivo
             if not self.verificar_porta_listening(self.actual_coordinator['host'], self.actual_coordinator['port']):
-                print("[BOOTSTRAP] Coordenador morreu durante sync. Abortando sync para iniciar eleição.")
-                self.actual_coordinator = {} # Força lógica de eleição no loop principal
+                print("[BOOTSTRAP] Coordenador morreu durante sync.")
+                self.actual_coordinator = {} 
                 break
 
             sucesso = await self.solicitar_sincronizacao()
             if sucesso:
-                print("[BOOTSTRAP] Sincronização concluída com sucesso!")
+                print("[BOOTSTRAP] Sincronização concluída!")
                 self.ja_sincronizou = True
                 break
             else:
@@ -182,115 +273,110 @@ class Node:
         self.sSocket.listen(5)
         self.sSocket.setblocking(False)
         
-        # 1. Fase de Descoberta
         await self.descobrir_coordenador(listaNos)
-
-        # 2. Barreira de Sincronização (Impede eleição enquanto estiver desatualizado)
         await self.realizar_bootstrap_sync()
 
-        # 3. Loop de Operação Normal
+        self.thread_running = True
+        t_monitor = threading.Thread(target=self.thread_monitoramento_geral)
+        t_monitor.daemon = True 
+        t_monitor.start()
+        
+        await asyncio.sleep(0.5)
+
         while True: 
             loop = asyncio._get_running_loop()
             
-            nova_listaNos:list = []
-            for no in listaNos:
-                if self.verificar_porta_listening(no['host'],no['port']):
-                    nova_listaNos.append(no)
+            if not self.listaNosAtivos:
+                lista_para_eleicao = [n for n in listaNos if n['id'] == self._node_id]
+            else:
+                lista_para_eleicao = self.listaNosAtivos[:] # Cópia
+            
+            meu_no = next((n for n in listaNos if n['id'] == self._node_id), None)
+            if meu_no and meu_no not in lista_para_eleicao:
+                lista_para_eleicao.append(meu_no)
+            lista_para_eleicao.sort(key=lambda x: x['id'])
 
-            # Lógica de Eleição (Só ocorre se já passou da barreira de sync)
-            if self.get_socket_host() == nova_listaNos[0]['host'] and self.get_socket_port() == nova_listaNos[0]['port']:
+            # Lógica de Eleição
+            if self.get_socket_host() == lista_para_eleicao[0]['host'] and self.get_socket_port() == lista_para_eleicao[0]['port']:
                 coordenador_vazio = (self.actual_coordinator == {})
-                coord_morto = self.actual_coordinator != {} and not self.verificar_porta_listening(self.actual_coordinator['host'], self.actual_coordinator['port'])
+                coord_esta_ativo = False
+                if self.actual_coordinator:
+                    for n in lista_para_eleicao:
+                        if n['id'] == self.actual_coordinator['id']:
+                            coord_esta_ativo = True
+                            break
                 
-                # Se eu sou maior que o atual, eu devo assumir, MAS eu já estou sincronizado
-                # porque passei pela barreira.
+                coord_morto = (self.actual_coordinator != {}) and (not coord_esta_ativo)
+                
                 no_id_maior = False 
                 if self.actual_coordinator != {}:
-                    for no in nova_listaNos:
+                    for no in lista_para_eleicao:
                         if no['id'] > self.actual_coordinator['id']:
                             no_id_maior = True
                             break
                 
                 if coordenador_vazio or coord_morto or no_id_maior: 
-                    await self.iniciarEleicao(nova_listaNos)
+                    await self.iniciarEleicao(lista_para_eleicao)
 
             try:
-                #Espera conexão com o cliente
-                c, addr = await asyncio.wait_for(loop.sock_accept(self.sSocket), timeout=5.0)
-                #Faz com que a conexão não seja bloqueanted
+                c, addr = await asyncio.wait_for(loop.sock_accept(self.sSocket), timeout=1.0)
                 c.setblocking(False)
-                #Pega os dados que são recebidos
                 dados_brutos = await self.receber_dados(c, loop) 
                 
                 if dados_brutos:
-                    #Parse da mensagem
                     try: mensagem = json.loads(dados_brutos)
-                    except: 
-                        c.close(); continue
+                    except: c.close(); continue
 
                     if not self.validar_integridade(mensagem):
                         c.close(); continue
 
-                    #Pega atributos 'tipo' e 'conteudo'
                     tipo = mensagem.get('tipo')
                     conteudo = mensagem.get('conteudo')
 
-                    #Se tipo for 'WHO_IS_COORD', somente o primeiro nó da lista realiza essa operação
                     if tipo == 'WHO_IS_COORD':
-                        #Empacota as informações do coordernador e manda para os demais nós
                         resp = self.actual_coordinator if self.actual_coordinator else {}
                         pacote = self.empacotar_mensagem("COORDINATOR_INFO", resp)
                         await loop.sock_sendall(c, pacote)
 
-                    #Se tipo for 'CLIENT_REQUEST'
                     elif tipo == 'CLIENT_REQUEST':
-                        #Verifica se o próprio nó é um coordenador
                         resposta_payload = ""
                         if self._is_coordinator:
-                            print(f"--> [COORD] Query: {conteudo}")
-                            #Manda a querry dentro de 'conteudo' para o banco de dados
+                            print(f"--> [COORD] Executando: {conteudo}")
                             resultado_db = self.conexao_db(conteudo)
 
-                            #Se conteúdo não for uma consulta SELECT, faz um LOG e manda para os outros nós a querry
-                            #LOG serve para guardar as últimas operações realizadas
                             if not conteudo.strip().upper().startswith("SELECT"):
                                 novo_id = self.registrar_log(conteudo)
                                 self.salvar_estado(novo_id)
-                                await self.replicar_para_workers(conteudo, nova_listaNos)
+                                # REPLICAR PARA TODOS
+                                await self.replicar_para_workers(conteudo, self.listaNos) 
 
                             dados_retorno = {"resultado": resultado_db if resultado_db else "Sucesso.", "executor_id": self.get_node_id()}
                             resposta_payload = json.dumps(dados_retorno, default=str)
 
-                        #Se não for a mensagem deve ser mandada para o coordenador
                         else:
                             print(f"--> [WORKER] Redirecionando...")
                             resposta_payload = await self.consultar_coordenador(conteudo)
-                        #Empacotamento da resposta
+                        
                         pacote_resposta = self.empacotar_mensagem("RESPONSE", resposta_payload)
-                        #Manda para o cliente
                         await loop.sock_sendall(c, pacote_resposta)
 
-                    #Replica a última ação realizada pelo coordenador
                     elif tipo == 'REPLICATION':
                         self.conexao_db(conteudo)
                         self.ultimo_id_processado += 1
                         self.salvar_estado(self.ultimo_id_processado)
-                        # Salva no log para futuro
                         self.registrar_log_externo({'id': self.ultimo_id_processado, 'query': conteudo})
                     
-                    #Sincroniza com os outros nós, recebe mensagens como , quem é o atual coordenador
                     elif tipo == 'SYNC_REQUEST':
+                        # Sync Incremental (Log)
                         ultimo_id_cliente = int(conteudo)
-                        print(f"Pedido de Sync (ID Cliente: {ultimo_id_cliente})")
+                        print(f"Pedido de Sync Incremental (ID: {ultimo_id_cliente})")
                         logs_faltantes = [op for op in self.log_operacoes if op['id'] > ultimo_id_cliente]
                         pacote_resposta = self.empacotar_mensagem("SYNC_RESPONSE", json.dumps(logs_faltantes, default=str))
                         await loop.sock_sendall(c, pacote_resposta)
 
-                    #Recebe mensagem sobre o coordenador eleito
                     elif tipo == 'ELECTION_WINNER':
                          dados_coord = json.loads(conteudo)
                          self.set_actual_coordinator(dados_coord)
-                         #Se o nó atual tiver o mesmo ID do coordenador, ele se torna o coordenador
                          if dados_coord['id'] == self.get_node_id():
                              self.set_coordinator(True)
                              self.ja_sincronizou = True
@@ -298,6 +384,77 @@ class Node:
                              self.set_coordinator(False) 
                              self.ja_sincronizou = False 
                          print(f"Novo Coordenador: ID {dados_coord['id']}")
+                    
+                    elif tipo == 'CONSISTENCY_CHECK':
+                        checksums_mestre = json.loads(conteudo) # Dicionário do Mestre
+                        checksums_local = self.obter_checksum_por_tabela() # Dicionário Local
+                        
+                        tabelas_divergentes = []
+
+                        # Compara cada tabela do mestre com a local
+                        for tabela, hash_mestre in checksums_mestre.items():
+                            hash_local = checksums_local.get(tabela)
+                            
+                            if hash_local != hash_mestre:
+                                print(f"Divergência na tabela '{tabela}' (Mestre:{hash_mestre} != Local:{hash_local})")
+                                tabelas_divergentes.append(tabela)
+                        
+                        # Se encontrou diferenças, pede snapshot PARCIAL
+                        if tabelas_divergentes:
+                            print(f"Solicitando correção para: {tabelas_divergentes}")
+                            await self.solicitar_snapshot(tabelas_divergentes)
+                        else:
+                            print("[AUDITORIA] Réplica já está sincronizada.")
+                            pass
+
+                    elif tipo == 'REQUEST_SNAPSHOT':
+                        # O conteudo agora é uma lista de tabelas ex: ["usuarios", "pedidos"]
+                        # Se vier vazio, manda tudo (fallback)
+                        tabelas_solicitadas = json.loads(conteudo) if conteudo else []
+                        
+                        print(f"Gerando Snapshot parcial para: {tabelas_solicitadas if tabelas_solicitadas else 'TODAS'}")
+                        
+                        dump_parcial = {}
+                        conn = mysql.connector.connect(host=self.dbHost, port=self.dbPort, database='teste', user='root', password='teste')
+                        try:
+                            cursor = conn.cursor()
+                            
+                            # Se não pediu nenhuma específica, pega todas
+                            if not tabelas_solicitadas:
+                                cursor.execute("SHOW TABLES")
+                                tabelas_solicitadas = [t[0] for t in cursor.fetchall()]
+                            
+                            for nome_tabela in tabelas_solicitadas:
+                                # Verifica se tabela existe
+                                try:
+                                    cursor.execute(f"SELECT * FROM {nome_tabela}")
+                                    linhas = cursor.fetchall()
+                                    dump_parcial[nome_tabela] = linhas
+                                except: pass
+                                
+                        except Error as e:
+                            print(f"Erro Dump: {e}")
+                        finally:
+                            conn.close()
+
+                        pacote_resp = self.empacotar_mensagem("SNAPSHOT_DATA", json.dumps(dump_parcial, default=str))
+                        await loop.sock_sendall(c, pacote_resp)
+
+                    elif tipo == 'SNAPSHOT_DATA':
+                         print("Aplicando Snapshot de recuperação...")
+                         dados_recuperados = json.loads(conteudo)
+                         
+                         # ATENÇÃO: TRUNCATE APAGA TUDO PARA REESCREVER
+                         self.conexao_db("TRUNCATE TABLE data")
+                         
+                         if dados_recuperados:
+                             for linha in dados_recuperados:
+                                 # Adapte este INSERT para suas colunas reais
+                                 # Exemplo genérico: INSERT INTO data VALUES ('val1', 'val2')
+                                 vals = "', '".join([str(v) for v in linha])
+                                 query = f"INSERT INTO data VALUES ('{vals}')"
+                                 self.conexao_db(query)
+                         print("Recuperação completa. Banco sincronizado.")
 
                 try: c.shutdown(socket.SHUT_WR)
                 except: pass
@@ -323,23 +480,10 @@ class Node:
             return str(e)
         finally:
             if connection and connection.is_connected(): cursor.close(); connection.close()
-
-    #Verifica localmente e remotamente os nós a serem conectados
-    def verificar_porta_listening(self, host, porta):
-        actual_host = '127.0.0.1' if host == 'localhost' else host
-        try:
-            for conn in psutil.net_connections():
-                if (conn.laddr.ip == actual_host or conn.laddr.ip == '0.0.0.0') and conn.laddr.port == porta and conn.status == 'LISTEN': return True
-        except: pass 
-        try:
-            with socket.create_connection((actual_host, porta), timeout=0.2): return True
-        except: return False
     
-    #Realiza o checksum
     def gerar_checksum(self, conteudo: str) -> str:
         return hashlib.md5(conteudo.encode('utf-8')).hexdigest()
 
-    # Empacotamento em formato Json
     def empacotar_mensagem(self, tipo: str, conteudo) -> bytes:
         if isinstance(conteudo, (dict, list)): conteudo_str = json.dumps(conteudo, default=str)
         else: conteudo_str = str(conteudo)
@@ -347,31 +491,33 @@ class Node:
         print(f"Nó de ID {self._node_id} envia: {dados}")
         return json.dumps(dados, default=str).encode('utf-8')
 
-    #Usa o Checksum pra validar a integridade
     def validar_integridade(self, dados_json: dict) -> bool:
-        print(f"Checksum recebido: {dados_json.get('checksum')}", "Checksum gerado:", self.gerar_checksum(str(dados_json.get('conteudo'))))
         return dados_json.get('checksum') == self.gerar_checksum(str(dados_json.get('conteudo')))
     
-    #Decodifica os dados recebidos
     async def receber_dados(self, c, loop):
         try:
             data = await asyncio.wait_for(loop.sock_recv(c, 8192), timeout=5.0)
             return data.decode().strip()
         except: return None
 
-    #Replicação de mensagens para os outros nós
-    async def replicar_para_workers(self, query, lista_atual_nos):
+    async def replicar_para_workers(self, query, lista_completa_nos):
+        print(f"--- Iniciando Replicação para {len(lista_completa_nos)-1} nós ---")
         pacote = self.empacotar_mensagem("REPLICATION", query)
-        for maquina in lista_atual_nos:
+        for maquina in lista_completa_nos:
             if maquina['id'] == self._node_id: continue
+            print(f"Tentando replicar para Nó {maquina['id']} ({maquina['host']}:{maquina['port']})...")
             try:
-                #Nó aqui é sincrono
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(2); s.connect((maquina['host'], maquina['port']))
-                s.sendall(pacote); s.shutdown(socket.SHUT_WR); s.close()
-            except: pass
+                s.settimeout(3) 
+                s.connect((maquina['host'], maquina['port']))
+                s.sendall(pacote)
+                try: s.shutdown(socket.SHUT_WR)
+                except: pass
+                s.close()
+                print(f"Replicação enviada para Nó {maquina['id']}")
+            except Exception as e:
+                print(f"Falha ao replicar para Nó {maquina['id']}: {e}")
 
-    #Consulta ao coordenador, para pegar informações atuais
     async def consultar_coordenador(self, query):
         if not self.actual_coordinator: return "Sem coordenador."
         pacote = self.empacotar_mensagem("CLIENT_REQUEST", query)
@@ -389,7 +535,6 @@ class Node:
         except Exception as e: return f"Erro: {e}"
         finally: s.close()
     
-    #Solicitação de sincronização ao coordenador
     async def solicitar_sincronizacao(self):
         if not self.actual_coordinator: return False
         print(f"Sincronizando... (Último ID Local: {self.ultimo_id_processado})")
@@ -423,4 +568,50 @@ class Node:
         except Exception as e:
             print(f"Erro Sync: {e}")
             return False
+        finally: s.close()
+
+    async def solicitar_snapshot(self, tabelas_alvo=None):
+        if not self.actual_coordinator: return
+        
+        # Envia a lista de tabelas que deve corrigir
+        conteudo_req = json.dumps(tabelas_alvo) if tabelas_alvo else ""
+        pacote = self.empacotar_mensagem("REQUEST_SNAPSHOT", conteudo_req)
+        
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.settimeout(30.0)
+        try:
+            s.connect((self.actual_coordinator['host'], self.actual_coordinator['port']))
+            s.sendall(pacote)
+            
+            dados_completos = b""
+            while True:
+                chunk = s.recv(4096)
+                if not chunk: break
+                dados_completos += chunk
+            
+            if dados_completos:
+                msg = json.loads(dados_completos.decode())
+                if msg['tipo'] == 'SNAPSHOT_DATA':
+                     dados_recuperados = json.loads(msg['conteudo'])
+                     
+                     conn = mysql.connector.connect(host=self.dbHost, port=self.dbPort, database='teste', user='root', password='teste')
+                     cursor = conn.cursor()
+                     try:
+                         cursor.execute("SET FOREIGN_KEY_CHECKS = 0")
+                         for nome_tabela, linhas in dados_recuperados.items():
+                             print(f"--- Reparando tabela: {nome_tabela} ---")
+                             cursor.execute(f"TRUNCATE TABLE {nome_tabela}")
+                             if linhas:
+                                 for linha in linhas:
+                                     vals = "', '".join([str(v).replace("'", "''") for v in linha])
+                                     query = f"INSERT INTO {nome_tabela} VALUES ('{vals}')"
+                                     cursor.execute(query)
+                         conn.commit()
+                         print("Tabelas divergentes sincronizadas.")
+                     except Exception as e:
+                         print(f"Erro restore: {e}")
+                     finally:
+                         cursor.execute("SET FOREIGN_KEY_CHECKS = 1")
+                         conn.close()
+        except Exception as e:
+            print(f"Erro Snapshot: {e}")
         finally: s.close()
